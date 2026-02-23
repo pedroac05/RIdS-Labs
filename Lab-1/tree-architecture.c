@@ -22,7 +22,7 @@ static uint8_t pending_rebroadcast; //donde se guarda el mensaje mientras pasa e
 static uint8_t rebroadcast_scheduled = 0; //bandera para controlar los eventos y mensajes en cola
 /*---------------------------------------------------------------------------*/
 static void
-do_rebroadcast(void *ptr) // la función para enviar los mensajes con delay
+broadcast_rssi(void *ptr) // la función para enviar los mensajes con delay
 {
   packetbuf_copyfrom(&pending_rebroadcast, 1); //guarda el mensaje a enviar en el buffer
   broadcast_send(&broadcast); //inicia el broadcast
@@ -34,14 +34,13 @@ do_rebroadcast(void *ptr) // la función para enviar los mensajes con delay
 }
 
 static void
-broadcast_recv(struct broadcast_conn *c, const linkaddr_t *from) // Función de callback, se define con *c la conexión, y con *from de dónde viene
+rssi_recv(struct broadcast_conn *c, const linkaddr_t *from) // Función de callback, se define con *c la conexión, y con *from de dónde viene
 {
   leds_on(LEDS_GREEN); // se inician los leds en verde cuando se recibe data
   uint8_t *recv_data = (uint8_t *)packetbuf_dataptr(); //untagged integer de 1 byte, se llena el buffer
+  int16_t rssi = (int16_t)packetbuf_attr(PACKETBUF_ATTR_RSSI); // obtiene la intensidad de señal en dBm
 
-  // printf("broadcast message received from %d.%d: %u\n",
-  //        from->u8[0], from->u8[1], (uint8_t)packetbuf_dataptr());
-  printf("Message received: {%d.%u}\n",from->u8[0], recv_data[0]); // identifica el id del nodo y el contador de mensajes
+  printf("Message received: {%d.%u} RSSI: %d dBm\n", from->u8[0], recv_data[0], rssi); // identifica el id del nodo, el contador y el RSSI
   
   uint8_t new_message_received = recv_data[0] + 1; //es la que recibe el mensaje y le aumenta uno al contador
   pending_rebroadcast = new_message_received; // iguala el mensaje con delay con el mensaje "recibido"
@@ -50,13 +49,13 @@ broadcast_recv(struct broadcast_conn *c, const linkaddr_t *from) // Función de 
     rebroadcast_scheduled = 1; //levanta la bandera
 
     clock_time_t delay = (CLOCK_SECOND / 5) + (random_rand() % (CLOCK_SECOND / 3)); //calcula el delay, se agrega el jitter "(random_rand() % (CLOCK_SECOND / 3)" para evitar que se sobrelape la transmición
-    ctimer_set(&rebroadcast_timer, delay, do_rebroadcast, NULL); //detecta el timer, espera el delay, después del delay, vuelve a enviar el mensaje, devuelve un null al callback pq no usamos el ptr
+    ctimer_set(&rebroadcast_timer, delay, broadcast_rssi, NULL); //detecta el timer, espera el delay, después del delay, vuelve a enviar el mensaje, devuelve un null al callback pq no usamos el ptr
   }
 
   message_received = 1; //eleva la bandera, para salir del proceso
   leds_off(LEDS_GREEN); //apaga el led
 }
-static const struct broadcast_callbacks broadcast_call = {broadcast_recv}; // esta la necesito enntender
+static const struct broadcast_callbacks broadcast_call = {rssi_recv}; // esta la necesito enntender
 /*---------------------------------------------------------------------------*/
 PROCESS_THREAD(example_broadcast_process, ev, data) // Inicia el proceso de contiki
 {
