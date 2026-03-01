@@ -58,15 +58,15 @@ MEMB(preferred_parent_mem, struct preferred_parent, 10);
 LIST(preferred_parent_list);
 
 /*---------------------------------------------------------------------------*/
-PROCESS(example_broadcast_process, "Broadcast example");
+PROCESS(broadcast_rssi, "Broadcast example");
 PROCESS( proceso_timer , "Proceso_corre_timer" );
 PROCESS( proceso_posteamos , "proceso_posteamos" );
 PROCESS(example_unicast_process, "Example unicast");
-AUTOSTART_PROCESSES(&example_broadcast_process, &proceso_timer, &proceso_posteamos, &example_unicast_process);
+AUTOSTART_PROCESSES(&broadcast_rssi, &proceso_timer, &proceso_posteamos, &example_unicast_process);
 
 /*---------------------------------------------------------------------------*/
 static void
-broadcast_recv(struct broadcast_conn *c, const linkaddr_t *from)
+register_parent(struct broadcast_conn *c, const linkaddr_t *from)
 {
   uint16_t last_rssi;
 
@@ -164,7 +164,7 @@ sent_uc(struct unicast_conn *c, int status, int num_tx)
 }
 /*---------------------------------------------------------------------------*/
 
-static const struct broadcast_callbacks broadcast_call = {broadcast_recv};
+static const struct broadcast_callbacks broadcast_call = {register_parent};
 static struct broadcast_conn broadcast;
 
 
@@ -281,7 +281,7 @@ PROCESS_THREAD(proceso_timer, ev, data)
 
 /*---------------------------------------------------------------------------*/
 
-PROCESS_THREAD(example_broadcast_process, ev, data)
+PROCESS_THREAD(broadcast_rssi, ev, data)
 {
   static struct etimer et;
 
