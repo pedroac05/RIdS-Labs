@@ -65,6 +65,8 @@ PROCESS(example_unicast_process, "Example unicast");
 AUTOSTART_PROCESSES(&broadcast_rssi, &select_prefered_parent, &print_parent_list, &example_unicast_process);
 
 /*---------------------------------------------------------------------------*/
+struct preferred_parent parent = { .id = linkaddr_node_addr, .rssi_a = 1 };
+/*---------------------------------------------------------------------------*/
 static void
 register_parent(struct broadcast_conn *c, const linkaddr_t *from)
 {
@@ -213,10 +215,11 @@ PROCESS_THREAD(example_unicast_process, ev, data)
     printf("Ticks per second: %u\n", RTIMER_SECOND);  // Imprime los ticks por segundo
 
     packetbuf_copyfrom("Hello", 5);  // Copia el mensaje "Hello" (5 bytes) en el buffer de paquetes
+    
     // Se construye la direccion del nodo destino
-    // TODO: CAMBIAR ESTO PARA QUE SEA EL PADRE
-    addr.u8[0] = 1;
-    addr.u8[1] = 0;
+    addr.u8[0] = parent.u8[0];
+    addr.u8[1] = parent.u8[1];
+    
     // Si la direccion del nodo destino no es la direccion del nodo actual
     if(!linkaddr_cmp(&addr, &linkaddr_node_addr)) {
       // Se establece el tipo de mensaje unicast como control
@@ -269,7 +272,6 @@ PROCESS_THREAD(print_parent_list, ev, data)
 /*---------------------------------------------------------------------------*/
 
 // Cada 2 segundos se imprime un "Corriendo select_prefered_parent"
-// TODO: IMPLEMENTAR LOGICA DE SELECCION DE PADRE
 PROCESS_THREAD(select_prefered_parent, ev, data)
 {
 
@@ -285,8 +287,18 @@ PROCESS_THREAD(select_prefered_parent, ev, data)
 
     PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
 
-    printf("Corriendo select_prefered_parent \n" );
+    printf("Seleccionando padre preferido \n" );
 
+    // Seleccionar el padre preferido
+    struct preferred_parent *p;
+    struct preferred_parent *p_max = &parent;
+    for(p = list_head(preferred_parent_list); p != NULL; p = list_item_next(p))
+    {
+      if(p->rssi_a > 0) continue; // Evitamos que los nodos que no conocen el camino hacia la raiz (RSSI_A > 0) sean seleccionados
+      if(p->rssi_a > p_max->rssi_a) p_max = p; // Si el nodo actual tiene un mejor RSSI, se selecciona como padre preferido
+    }
+
+    printf("Padre preferido seleccionado: ID=%d RSSI_A = %d \n", parent.u8[0], parent.u8[1]);
 
   }
 
@@ -322,8 +334,7 @@ PROCESS_THREAD(broadcast_rssi, ev, data)
     //b.id.u8[1] = linkaddr_node_addr.u8[1];
     //b.rssi_a   = -10;
 
-    // TODO: ENVIAR EL RSSI COMPLETO
-    llenar_beacon(&b, linkaddr_node_addr, -10);
+    llenar_beacon(&b, linkaddr_node_addr, parent.rssi_a);
 
 
     packetbuf_copyfrom(&b, sizeof( struct beacon ));
@@ -332,7 +343,7 @@ PROCESS_THREAD(broadcast_rssi, ev, data)
 
     printf_hello();
 
-    printf("NODE ID = %d.%d\n", linkaddr_node_addr.u8[0], linkaddr_node_addr.u8[1]  );
+    printf("NODE ID = %d.%d\n", linkaddr_node_addr.u8[0], linkaddr_node_addr.u8[1]);
 
 
     printf("#A color=orange\n"); //A = area
