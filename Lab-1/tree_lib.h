@@ -73,27 +73,11 @@ struct beacon {
  * MEMB() y LIST() de Contiki.
  */
 struct preferred_parent {
-  /**
-   * \brief Puntero al siguiente elemento en la lista enlazada.
-   *
-   * Este campo es requerido internamente por la macro LIST()
-   * de Contiki. Debe ser el primer campo del struct.
-   */
-  struct preferred_parent *next;
-
-  /** \brief Dirección Rime del vecino candidato a padre. */
-  linkaddr_t id;
-
-  /**
-   * \brief RSSI acumulado a través de este padre.
-   *
-   * Se calcula como: rssi_a = beacon.rssi_p + RSSI_del_enlace_local.
-   * Un valor más alto (menos negativo) indica un mejor camino
-   * hacia la raíz.
-   */
-  int16_t rssi_a;
-};
-
+   struct preferred_parent *next;
+   linkaddr_t id;
+   int16_t rssi_p;     // We use this field to store Neighbor's Hops
+   int8_t rssi_a;      // We use this field to store Link RSSI
+ };
 /*---------------------------------------------------------------------------*/
 /*                          Funciones                                        */
 /*---------------------------------------------------------------------------*/
