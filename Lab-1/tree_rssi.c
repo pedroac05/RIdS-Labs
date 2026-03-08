@@ -59,10 +59,10 @@ LIST(preferred_parent_list);
 
 /*---------------------------------------------------------------------------*/
 PROCESS(broadcast_rssi, "Broadcast example");
-PROCESS(proceso_timer , "Proceso_corre_timer" );
-PROCESS(proceso_posteamos , "proceso_posteamos" );
+PROCESS(select_prefered_parent , "Proceso_corre_timer" );
+PROCESS(print_parent_list , "print_parent_list" );  // Imprime la lista de padres
 PROCESS(example_unicast_process, "Example unicast");
-AUTOSTART_PROCESSES(&broadcast_rssi, &proceso_timer, &proceso_posteamos, &example_unicast_process);
+AUTOSTART_PROCESSES(&broadcast_rssi, &select_prefered_parent, &print_parent_list, &example_unicast_process);
 
 /*---------------------------------------------------------------------------*/
 static void
@@ -98,22 +98,24 @@ register_parent(struct broadcast_conn *c, const linkaddr_t *from)
   // y tengo que agregar el beacon a la lista
   if(p == NULL)
   {
-    in_l = memb_alloc(&preferred_parent_mem); // Entrega la dir de memoria de un struct preferred_parent
-    if(in_l == NULL) {            // If we could not allocate a new entry, we give up.
+    in_l = memb_alloc(&preferred_parent_mem); // entrega la dir de memoria para un nuevo padre o null si no hay espacio
+    if(in_l == NULL) {            // Si preferred_parent_mem no tiene espacio para nuevos padres, imprime error
       printf("ERROR: we could not allocate a new entry for <<preferred_parent_list>> in tree_rssi\n");
-    }else
+    }else // Si preferred_parent_mem tiene espacio para nuevos padres
     {
       //Guardo los campos del mensaje
-      in_l->id       = b_recv.id; // Guardo el id del nodo
-      //rssi_ac es el rssi del padre + el rssi del enlace al padre
-      in_l->rssi_a  = b_recv.rssi_p + last_rssi; // Guardo del rssi acumulado. El rssi acumulado es el rssi divulgado por el nodo (rssi_path) + el rssi medido del beacon que acaba de llegar (rss)
+      in_l->id = b_recv.id; // Guardo el id del nodo en la posicion de memoria que dio memb_alloc
+      
+      //rssi_a es el rssi del padre + el rssi del enlace al padre
+      in_l->rssi_a = b_recv.rssi_p + last_rssi; // Guardo del rssi acumulado. El rssi acumulado es el rssi divulgado por el nodo (rssi_path) + el rssi medido del beacon que acaba de llegar (rss)
       list_push(preferred_parent_list,in_l); // Add an item to the start of the list.
       printf("beacon added to list: id = %d rssi_a = %d\n", in_l->id.u8[0], in_l->rssi_a);
 
     }
-  }else // Si el padre era conocido actualizo su rssi
+  }else // Si p apunta a un padre en la lista preferred_parent_list
   {
-    p->rssi_a = b_recv.rssi_p + last_rssi; // Guardo del rssi. El rssi es igual al rssi_path + rssi del broadcast
+    // Actualizo el rssi del padre
+    p->rssi_a = b_recv.rssi_p + last_rssi;
     printf("beacon updated to list with RSSI_A = %d\n", p->rssi_a);
 
   }
@@ -126,7 +128,7 @@ register_parent(struct broadcast_conn *c, const linkaddr_t *from)
   printf("broadcast message received from %d.%d: '%s'\n",
          from->u8[0], from->u8[1], (char *)packetbuf_dataptr());
 
-  process_post(&proceso_posteamos, PROCESS_EVENT_CONTINUE, NULL);
+  process_post(&print_parent_list, PROCESS_EVENT_CONTINUE, NULL);
 }
 
 /*---------------------------------------------------------------------------*/
@@ -136,27 +138,35 @@ recv_uc(struct unicast_conn *c, const linkaddr_t *from)
 
   packetbuf_attr_t msg_type = packetbuf_attr(PACKETBUF_ATTR_UNICAST_TYPE);
 
-  if(msg_type == U_DATA)
+  if(msg_type == U_DATA)  // Si el mensaje es de tipo data
   {
 
     printf("unicast U_DATA message received from %d.%d\n",
      from->u8[0], from->u8[1]);
 
-  }else
-  if(msg_type == U_CONTROL)
+  }else if(msg_type == U_CONTROL)  // Si el mensaje es de tipo control
   {
 
     printf("unicast U_CONTROL message received from %d.%d\n",
      from->u8[0], from->u8[1]);
   }
 
-
 }
 /*---------------------------------------------------------------------------*/
+/** 
+ * \brief Función que se ejecuta cuando se envía un mensaje unicast.
+ * \param c: puntero a la conexión unicast que realizó el envío
+ * \param status: estado del envío. 0 = éxito, 1 = fallo
+ * \param num_tx: número de veces que se intentó transmitir el paquete (contando reintentos).
+ */
 static void
 sent_uc(struct unicast_conn *c, int status, int num_tx)
 {
+  // Lee del buffer de paquetes la dirección del nodo destino
   const linkaddr_t *dest = packetbuf_addr(PACKETBUF_ADDR_RECEIVER);
+
+  // Si dest es 0.0 no se hace nada. 0.0 significa que el mensaje fue
+  // un broadcast, no un unicast.
   if(linkaddr_cmp(dest, &linkaddr_null)) {
     return;
   }
@@ -175,38 +185,43 @@ static struct unicast_conn uc;
 /*---------------------------------------------------------------------------*/
 PROCESS_THREAD(example_unicast_process, ev, data)
 {
+  // si el proceso termina, se cierra la conexión unicast
   PROCESS_EXITHANDLER(unicast_close(&uc);)
 
   PROCESS_BEGIN();
 
-  powertrace_start(CLOCK_SECOND * 10);
+  powertrace_start(CLOCK_SECOND * 10);  // Cada 10 segundos se guarda el consumo de energia
 
-  unicast_open(&uc, 146, &unicast_callbacks);
+  unicast_open(&uc, 146, &unicast_callbacks);  // Se abre la conexión unicast
 
   while(1) {
     static struct etimer et;
-    linkaddr_t addr;
+    linkaddr_t addr;  // Direccion del nodo destino
 
     etimer_set(&et, CLOCK_SECOND );
 
-    PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
+    PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));  // Espera un segundo
 
-    printf("#L 3 1\n"); // 1 = Dibujar el enlace/link
+    printf("#L 3 1\n"); // 1 = Dibujar el enlace/link (exclusivo para Cooja)
 
     etimer_set(&et, CLOCK_SECOND );
 
-    PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
+    PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));  // Espera un segundo
 
-    printf("#L 3 0\n"); // 0 = Borramos el enlace/link
+    printf("#L 3 0\n"); // 0 = Borramos el enlace/link (exclusivo para Cooja)
 
-    printf("Ticks per second: %u\n", RTIMER_SECOND);
+    printf("Ticks per second: %u\n", RTIMER_SECOND);  // Imprime los ticks por segundo
 
-    packetbuf_copyfrom("Hello", 5);
+    packetbuf_copyfrom("Hello", 5);  // Copia el mensaje "Hello" (5 bytes) en el buffer de paquetes
+    // Se construye la direccion del nodo destino
+    // TODO: CAMBIAR ESTO PARA QUE SEA EL PADRE
     addr.u8[0] = 1;
     addr.u8[1] = 0;
+    // Si la direccion del nodo destino no es la direccion del nodo actual
     if(!linkaddr_cmp(&addr, &linkaddr_node_addr)) {
-
+      // Se establece el tipo de mensaje unicast como control
       packetbuf_set_attr(PACKETBUF_ATTR_UNICAST_TYPE, U_CONTROL);
+      // Se envia el mensaje unicast
       unicast_send(&uc, &addr);
     }
 
@@ -218,8 +233,8 @@ PROCESS_THREAD(example_unicast_process, ev, data)
 
 
 /*---------------------------------------------------------------------------*/
-
-PROCESS_THREAD(proceso_posteamos, ev, data)
+/* Proceso que se encarga de imprimir la lista de padres */
+PROCESS_THREAD(print_parent_list, ev, data)
 {
 
   PROCESS_BEGIN();
@@ -229,12 +244,12 @@ PROCESS_THREAD(proceso_posteamos, ev, data)
   while(1)
   {
 
-    PROCESS_WAIT_EVENT();
+    PROCESS_WAIT_EVENT(); // Espera el evento en la recepcion de un beacon
 
-    printf("Corriendo proceso_posteamos\n" );
+    printf("Corriendo print_parent_list\n" );
 
 
-    //recorrer la LISTA
+    // Imprime la lista de padres
 
     printf("-------\n");
     for(p = list_head(preferred_parent_list); p != NULL; p = list_item_next(p))
@@ -253,8 +268,9 @@ PROCESS_THREAD(proceso_posteamos, ev, data)
 
 /*---------------------------------------------------------------------------*/
 
-
-PROCESS_THREAD(proceso_timer, ev, data)
+// Cada 2 segundos se imprime un "Corriendo select_prefered_parent"
+// TODO: IMPLEMENTAR LOGICA DE SELECCION DE PADRE
+PROCESS_THREAD(select_prefered_parent, ev, data)
 {
 
   static struct etimer et;
@@ -269,7 +285,7 @@ PROCESS_THREAD(proceso_timer, ev, data)
 
     PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
 
-    printf("Corriendo proceso_timer \n" );
+    printf("Corriendo select_prefered_parent \n" );
 
 
   }
@@ -306,8 +322,8 @@ PROCESS_THREAD(broadcast_rssi, ev, data)
     //b.id.u8[1] = linkaddr_node_addr.u8[1];
     //b.rssi_a   = -10;
 
+    // TODO: ENVIAR EL RSSI COMPLETO
     llenar_beacon(&b, linkaddr_node_addr, -10);
-
 
 
     packetbuf_copyfrom(&b, sizeof( struct beacon ));
@@ -315,8 +331,6 @@ PROCESS_THREAD(broadcast_rssi, ev, data)
     printf("broadcast message sent\n");
 
     printf_hello();
-
-
 
     printf("NODE ID = %d.%d\n", linkaddr_node_addr.u8[0], linkaddr_node_addr.u8[1]  );
 
@@ -329,11 +343,6 @@ PROCESS_THREAD(broadcast_rssi, ev, data)
     PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
 
     printf("#A color=white\n"); //A = area
-
-
-
-
-
 
   }
 
