@@ -59,8 +59,8 @@ LIST(preferred_parent_list);
 
 /*---------------------------------------------------------------------------*/
 PROCESS(broadcast_rssi, "Broadcast example");
-PROCESS( proceso_timer , "Proceso_corre_timer" );
-PROCESS( proceso_posteamos , "proceso_posteamos" );
+PROCESS(proceso_timer , "Proceso_corre_timer" );
+PROCESS(proceso_posteamos , "proceso_posteamos" );
 PROCESS(example_unicast_process, "Example unicast");
 AUTOSTART_PROCESSES(&broadcast_rssi, &proceso_timer, &proceso_posteamos, &example_unicast_process);
 
@@ -70,10 +70,12 @@ register_parent(struct broadcast_conn *c, const linkaddr_t *from)
 {
   uint16_t last_rssi;
 
-  last_rssi = packetbuf_attr(PACKETBUF_ATTR_RSSI);
+  last_rssi = packetbuf_attr(PACKETBUF_ATTR_RSSI); // registra el rssi del beacon que llego
 
   void *msg = packetbuf_dataptr(); //msg que llego
 
+  // interpreta el puntero msg como un puntero a un struct beacon y
+  // lo copia en b_recv con el asterisco del inicio
   struct beacon b_recv = *( (struct beacon*) msg );
 
 
@@ -84,30 +86,29 @@ register_parent(struct broadcast_conn *c, const linkaddr_t *from)
   //Revisar si ya conozco este posible padre
   for(p = list_head(preferred_parent_list); p != NULL; p = list_item_next(p))
   {
-     // We break out of the loop if the address of the neighbor matches
-    //    the address of the neighbor from which we received this
-    //    broadcast message.
-     if(linkaddr_cmp(&p->id, &b_recv.id)) {
-       break;
-     }
+    // Si el id del padre es igual al id del beacon que llego
+    // rompo el bucle
+    if(linkaddr_cmp(&p->id, &b_recv.id)) {
+      break;
+    }
   }
 
 
-  //Si no conocia este posible padre
+  // Si recorri toda la lista y no encontre el id del beacon, p es NULL 
+  // y tengo que agregar el beacon a la lista
   if(p == NULL)
   {
-    //ADD to the list
-    in_l = memb_alloc(&preferred_parent_mem);
+    in_l = memb_alloc(&preferred_parent_mem); // Entrega la dir de memoria de un struct preferred_parent
     if(in_l == NULL) {            // If we could not allocate a new entry, we give up.
       printf("ERROR: we could not allocate a new entry for <<preferred_parent_list>> in tree_rssi\n");
     }else
     {
-        //Guardo los campos del mensaje
-        in_l->id       = b_recv.id; // Guardo el id del nodo
-        //rssi_ac es el rssi del padre + el rssi del enlace al padre
-        in_l->rssi_a  = b_recv.rssi_p + last_rssi; // Guardo del rssi acumulado. El rssi acumulado es el rssi divulgado por el nodo (rssi_path) + el rssi medido del beacon que acaba de llegar (rss)
-        list_push(preferred_parent_list,in_l); // Add an item to the start of the list.
-        printf("beacon added to list: id = %d rssi_a = %d\n", in_l->id.u8[0], in_l->rssi_a);
+      //Guardo los campos del mensaje
+      in_l->id       = b_recv.id; // Guardo el id del nodo
+      //rssi_ac es el rssi del padre + el rssi del enlace al padre
+      in_l->rssi_a  = b_recv.rssi_p + last_rssi; // Guardo del rssi acumulado. El rssi acumulado es el rssi divulgado por el nodo (rssi_path) + el rssi medido del beacon que acaba de llegar (rss)
+      list_push(preferred_parent_list,in_l); // Add an item to the start of the list.
+      printf("beacon added to list: id = %d rssi_a = %d\n", in_l->id.u8[0], in_l->rssi_a);
 
     }
   }else // Si el padre era conocido actualizo su rssi
