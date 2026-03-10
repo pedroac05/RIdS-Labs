@@ -7,5 +7,8 @@ all: example-abc example-mesh example-collect example-trickle example-polite \
 
 PROJECT_SOURCEFILES += tree_lib.c
 
+APPS += powertrace
+
 CONTIKI_WITH_RIME = 1
+
 include $(CONTIKI)/Makefile.include
