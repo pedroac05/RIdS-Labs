@@ -4,6 +4,7 @@
 #include "dev/button-sensor.h"
 #include "dev/leds.h"
 #include <stdio.h>
+#include <string.h>
 #include "tree_lib.h"
 #include "powertrace.h"
 
@@ -28,8 +29,8 @@ static const struct unicast_callbacks unicast_callbacks = {recv_uc, sent_uc};// 
 PROCESS(broadcast_rssi, "Beaconing");// Proceso encargado de enviar beacons periódicamente.
 PROCESS(select_prefered_parent, "RSSI Sum Selection");// Proceso encargado de seleccionar el mejor padre según la suma de RSSI.
 PROCESS(print_parent_list, "Debug Table");// Proceso encargado de imprimir una tabla de vecinos y decisiones.
-PROCESS(example_unicast_process, "Data Flow");// Proceso encargado de enviar datos al padre seleccionado.
-AUTOSTART_PROCESSES(&broadcast_rssi, &select_prefered_parent, &print_parent_list, &example_unicast_process);// Hace que esos 4 procesos arranquen automáticamente cuando inicia el nodo.
+PROCESS(send_unicast_data, "Data Flow");// Proceso encargado de enviar datos al padre seleccionado.
+AUTOSTART_PROCESSES(&broadcast_rssi, &select_prefered_parent, &print_parent_list, &send_unicast_data);// Hace que esos 4 procesos arranquen automáticamente cuando inicia el nodo.
 
 /* -------------------------------------------------------------------------- */
 /* CALLBACK: Register Neighbor & Calculate Summed Path RSSI                   */
@@ -64,6 +65,33 @@ register_parent(struct broadcast_conn *c, const linkaddr_t *from)
 
   p->rssi_a = last_rssi;
   // Guarda el RSSI local directo.
+
+  /* --- Selección del mejor padre en línea --- */
+  if(linkaddr_node_addr.u8[0] == 1) return;
+  // La raíz no necesita elegir padre.
+
+  struct preferred_parent *q;
+  int16_t best_path = -1000;
+  struct preferred_parent *winner = NULL;
+  for(q = list_head(preferred_parent_list); q != NULL; q = list_item_next(q)) {
+    if(q->rssi_p > best_path && q->rssi_p < 0) {
+      best_path = q->rssi_p;
+      winner = q;
+    }
+  }
+  if(winner != NULL) {
+    printf("#L %d 0\n", best_parent_id.u8[0]);
+    // Borra la línea del anterior padre.
+
+    linkaddr_copy(&best_parent_id, &winner->id);
+    // Actualiza el mejor padre con el vecino de mejor ruta acumulada.
+    my_path_rssi = best_path;
+    // Actualiza la métrica propia.
+    
+    printf("#L %d 1\n", best_parent_id.u8[0]);
+    // Dibuja una línea hacia el padre en la visualización.
+  }
+}  // <-- cierre de register_parent
 
 /* -------------------------------------------------------------------------- */
 /* THREAD 1: Broadcast our Accumulated Path RSSI                              */
@@ -113,55 +141,18 @@ PROCESS_THREAD(broadcast_rssi, ev, data)
 }
 
 /* -------------------------------------------------------------------------- */
-/* THREAD 2: Select Parent with the "Highest" Sum (Closest to 0)              */
+/* THREAD 2: Initialize Root (parent selection now in register_parent)        */
 /* -------------------------------------------------------------------------- */
 PROCESS_THREAD(select_prefered_parent, ev, data)
 {
-  static struct etimer et;// Timer para decidir cada cuánto reevaluar el mejor padre.
-  struct preferred_parent *p;// Puntero para recorrer la lista de vecinos.
-
   PROCESS_BEGIN();
 
   if(linkaddr_node_addr.u8[0] == 1) {
-    // Si este nodo es la raíz...
+    // Si este nodo es la raíz, fija su métrica a 0 y termina.
     my_path_rssi = 0;
-    // La raíz tiene métrica 0.
-    PROCESS_EXIT();
-    // Sale del proceso porque la raíz no necesita elegir padre.
   }
-
-  while(1) {
-    etimer_set(&et, CLOCK_SECOND * 5);
-    // Reevalúa el mejor padre cada 5 segundos.
-    PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
-    // Espera hasta que expire el timer.
-    int16_t best_path = -1000;
-    // Inicializa el mejor valor como inválido.
-    struct preferred_parent *winner = NULL;
-    // Inicialmente no hay ningún ganador.
-    for(p = list_head(preferred_parent_list); p != NULL; p = list_item_next(p)) {
-      // Recorre todos los vecinos registrados.
-
-      if(p->rssi_p > best_path && p->rssi_p < 0) {
-        // Como el RSSI es negativo, un valor "más alto" es mejor.
-        // Ejemplo: -150 es mejor que -250.
-        // Además se ignoran valores inválidos o no útiles.
-
-        best_path = p->rssi_p;
-        // Actualiza el mejor camino encontrado.
-        winner = p;
-        // Guarda el vecino que ofrece ese mejor camino.
-      }
-    }
-
-    if(winner != NULL) {
-      // Si encontró un mejor vecino válido...
-      linkaddr_copy(&best_parent_id, &winner->id);
-      // Guarda la dirección de ese vecino como mejor padre.
-      my_path_rssi = best_path;
-      // Actualiza la métrica propia con la mejor ruta encontrada.
-    }
-  }
+  // La selección de mejor padre se realiza directamente en el
+  // callback register_parent() cada vez que llega un beacon.
 
   PROCESS_END();
 }
@@ -223,7 +214,7 @@ PROCESS_THREAD(print_parent_list, ev, data)
 /* -------------------------------------------------------------------------- */
 /* THREAD 4: Data Transmission                                                */
 /* -------------------------------------------------------------------------- */
-PROCESS_THREAD(example_unicast_process, ev, data)
+PROCESS_THREAD(send_unicast_data, ev, data)
 {
   static struct etimer et;// Timer para definir cada cuánto enviar datos.
 
@@ -246,15 +237,17 @@ PROCESS_THREAD(example_unicast_process, ev, data)
     if(!linkaddr_cmp(&best_parent_id, &linkaddr_null)) {
       // Solo envía si ya tiene un padre válido.
 
-      packetbuf_copyfrom("Data", 4);
-      // Copia la palabra "Data" al buffer de salida.
-      // Son 4 bytes: D a t a
+      char msg[32];
+      snprintf(msg, sizeof(msg), "Data from %d.%d",
+               linkaddr_node_addr.u8[0], linkaddr_node_addr.u8[1]);
+      // Construye el mensaje incluyendo el ID del nodo origen.
+
+      packetbuf_copyfrom(msg, strlen(msg) + 1);
+      // Copia el mensaje al buffer de salida (incluye el '\0' final).
 
       unicast_send(&uc, &best_parent_id);
       // Envía el paquete al padre seleccionado.
 
-      printf("#L %d 1\n", best_parent_id.u8[0]);
-      // Dibuja una línea hacia el padre en la visualización.
     }
   }
 
@@ -263,9 +256,24 @@ PROCESS_THREAD(example_unicast_process, ev, data)
 
 /* Unicast Callbacks */
 static void recv_uc(struct unicast_conn *c, const linkaddr_t *from) {
-  printf("DATA RECV from %d.%d\n", from->u8[0], from->u8[1]);
-  // Se ejecuta cuando este nodo recibe un paquete unicast.
-  // Solo imprime desde qué nodo llegó el dato.
+  uint8_t len = packetbuf_datalen();
+  char msg[64];
+  if(len >= sizeof(msg)) len = sizeof(msg) - 1;
+  memcpy(msg, packetbuf_dataptr(), len);
+  msg[len] = '\0';
+  // Copia el mensaje recibido a un buffer local.
+
+  printf("DATA RECV from %d.%d: %s\n", from->u8[0], from->u8[1], msg);
+  // Imprime desde qué nodo llegó el dato y su contenido.
+
+  if(!linkaddr_cmp(&best_parent_id, &linkaddr_null)) {
+    // Si este nodo tiene un padre válido, retransmite el mensaje hacia arriba.
+    packetbuf_copyfrom(msg, len + 1);
+    unicast_send(c, &best_parent_id);
+    printf("DATA FWRD to %d.%d: %s\n",
+           best_parent_id.u8[0], best_parent_id.u8[1], msg);
+    // Confirma la retransmisión por consola.
+  }
 }
 
 static void sent_uc(struct unicast_conn *c, int status, int num_tx) {
