@@ -5,10 +5,10 @@
 #include "dev/leds.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "tree_lib.h"
 #include "powertrace.h"
 #include "net/netstack.h"
-#define REMOTE 1
 
 /* -------------------------------------------------------------------------- */
 /*                         Memory & Lists                                     */
@@ -203,17 +203,9 @@ PROCESS_THREAD(broadcast_rssi, ev, data)
   PROCESS_EXITHANDLER(broadcast_close(&broadcast);)
   PROCESS_BEGIN();
 
-  #if REMOTE
-    static radio_value_t val;
-    if(NETSTACK_RADIO.set_value(RADIO_PARAM_TXPOWER, MY_TX_POWER_DBM) == RADIO_RESULT_OK) {
-      NETSTACK_RADIO.get_value(RADIO_PARAM_TXPOWER, &val);
-      printf("Transmission Power Set : %d dBm\n", val);
-    } else if(NETSTACK_RADIO.set_value(RADIO_PARAM_TXPOWER, MY_TX_POWER_DBM) == RADIO_RESULT_INVALID_VALUE) {
-      printf("ERROR: RADIO_RESULT_INVALID_VALUE\n");
-    } else {
-      printf("ERROR: The TX power could not be set\n");
-    }
-  #endif
+  /* TX power config omitted: RADIO_PARAM_TXPOWER not available in Contiki classic.
+   * To change TX power on Re-Mote, use cc2538_rf_set_tx_power() from
+   * cpu/cc2538/dev/cc2538-rf.h if needed. */
 
   broadcast_open(&broadcast, 129, &broadcast_call);
 
