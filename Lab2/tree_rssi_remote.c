@@ -335,11 +335,13 @@ PROCESS_THREAD(update_routing_table, ev, data)
 
     if(recv_n == 0) continue;
 
-    /* Registrar al emisor como hijo directo */
-    Add_child(routing_tree, &tree_n_nodes, MAX_TREE_NODES,
-              my_id, child_reporter);
+    uint8_t i, j;
 
-    /* Fusionar el subárbol recibido desde cero */
+    /* Registrar al emisor como hijo directo de este nodo */
+    Add_child(routing_tree, &tree_n_nodes, MAX_TREE_NODES,
+              linkaddr_node_addr.u8[0], recv_tree[0].id);
+
+    /* Fusionar el subárbol recibido */
     for(i = 0; i < recv_n; i++) {
       for(j = 0; j < recv_tree[i].num_children; j++) {
         Add_child(routing_tree, &tree_n_nodes, MAX_TREE_NODES,
@@ -347,7 +349,7 @@ PROCESS_THREAD(update_routing_table, ev, data)
       }
     }
 
-    /* Imprimir árbol actualizado */
+    /* Imprimir el árbol actualizado */
     printf("TREE (%u nodes): ", tree_n_nodes);
     for(i = 0; i < tree_n_nodes; i++) {
       printf("%u->[", routing_tree[i].id);
