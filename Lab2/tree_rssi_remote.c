@@ -3,13 +3,14 @@
 #include "random.h"
 #include "dev/button-sensor.h"
 #include "dev/leds.h"
+#include "dev/leds.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include "tree_lib.h"
 #include "powertrace.h"
 #include "net/netstack.h"
-
+#define REMOTE 1
 /* -------------------------------------------------------------------------- */
 /*                         Memory & Lists                                     */
 /* -------------------------------------------------------------------------- */
@@ -66,7 +67,13 @@ AUTOSTART_PROCESSES(
   &generate_pkt_dst,
   &routing_upstream_downstream
 );
-
+static void
+blink_blue(void)
+{
+  leds_on(LEDS_BLUE);
+  clock_delay_usec(10000);
+  leds_off(LEDS_BLUE);
+}
 /* ========================================================================== */
 /* CALLBACK: register_parent                                                  */
 /* ========================================================================== */
@@ -147,6 +154,12 @@ recv_uc(struct unicast_conn *c, const linkaddr_t *from)
     msg[payload_len] = '\0';
 
     printf("DATA RECV from %d.%d: %s\n", from->u8[0], from->u8[1], msg);
+    /* Blink LED when a data message is received */
+    /* This node currently has the message */
+    printf("MESSAGE IS NOW AT NODE %d.%d\n",
+       linkaddr_node_addr.u8[0],
+       linkaddr_node_addr.u8[1]);
+    blink_blue();
 
     struct pkt_entry *pe = memb_alloc(&pkt_mem);
     if(pe != NULL) {
@@ -389,6 +402,7 @@ PROCESS_THREAD(generate_pkt_dst, ev, data)
     list_push(pkt_list, pe);
 
     printf("PKT GEN: dst=%u msg=%s\n", pe->dst, pe->msg);
+    blink_blue();
     process_post(&routing_upstream_downstream, ev_route_pkt, NULL);
   }
 
@@ -416,7 +430,8 @@ PROCESS_THREAD(routing_upstream_downstream, ev, data)
       if(dst_id == my_id) {
         printf("PKT DELIVERED locally: %s\n", pe->msg);
         /* Nodo destino: color verde */
-        printf("#A color=green\n");
+        printf("#A color=blue\n");
+        blink_blue();
         memb_free(&pkt_mem, pe);
         continue;
       }
@@ -447,7 +462,7 @@ PROCESS_THREAD(routing_upstream_downstream, ev, data)
       /* Colorear nodo actual (azul) y dibujar enlace hacia siguiente salto */
       printf("#A color=blue\n");
       printf("#L %d 1\n", next_hop.u8[0]);
-
+      blink_blue();
       /* Construir payload: [U_DATA][DST:<id>:<msg>] */
       static char send_buf[42];
       uint8_t plen = snprintf(send_buf + 1, sizeof(send_buf) - 1,
