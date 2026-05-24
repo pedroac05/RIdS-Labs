@@ -10,6 +10,7 @@
 
 #include "contiki.h"
 #include "net/rime/rime.h"
+#include "sys/ctimer.h"
 #include <stdint.h>
 
 /*---------------------------------------------------------------------------*/
@@ -90,8 +91,9 @@ struct beacon {
 struct preferred_parent {
    struct preferred_parent *next;
    linkaddr_t id;
-   int16_t rssi_p;     /* Path RSSI acumulado hacia la raíz por este vecino */
+   int16_t rssi_p;     /* Path RSSI acumulado hacia la raiz por este vecino */
    int8_t rssi_a;      /* RSSI del enlace local directo hacia este vecino   */
+   struct ctimer keepalive; /* Timer de 5s: si expira, resetear trickle     */
  };
 
 /**
