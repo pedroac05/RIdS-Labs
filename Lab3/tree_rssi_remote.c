@@ -217,6 +217,7 @@ recv_uc(struct unicast_conn *c, const linkaddr_t *from)
       }
       if(pkt_src != 0) {
         /* Buscar o crear entrada en tabla de stats */
+        /*NOTA: este no sé si funciona bien, probar en simulación*/
         uint8_t si;
         struct pkt_stats *ps = NULL;
         for(si = 0; si < pkt_stats_count; si++) {
@@ -340,6 +341,9 @@ PROCESS_THREAD(select_prefered_parent, ev, data)
     routing_tree[0].num_children = 0;
     tree_n_nodes                 = 1;
   }
+
+  /* Activar powertrace: imprime perfil de energia cada 10 s */
+  powertrace_start(CLOCK_SECOND * 10);
 
   PROCESS_END();
 }
