@@ -3,39 +3,55 @@
 #include "random.h"
 #include "dev/button-sensor.h"
 #include "dev/leds.h"
+#include "dev/leds.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include "tree_lib.h"
 #include "powertrace.h"
 #include "net/netstack.h"
-
+#define REMOTE 1
 /* -------------------------------------------------------------------------- */
 /*                         Memory & Lists                                     */
 /* -------------------------------------------------------------------------- */
 
-/* --- Tabla de vecinos / padres preferidos --- */
 MEMB(preferred_parent_mem, struct preferred_parent, 10);
 LIST(preferred_parent_list);
 
-/* --- Árbol n-ario de enrutamiento (tabla de rutas) --- */
 #define MAX_TREE_NODES 20
 static struct tree_node routing_tree[MAX_TREE_NODES];
 static uint8_t tree_n_nodes = 0;
 
-/* --- Lista ligada de paquetes pendientes de enrutar (Figura 4) --- */
 MEMB(pkt_mem, struct pkt_entry, 10);
 LIST(pkt_list);
 
 /* -------------------------------------------------------------------------- */
+/*                  Packet Loss Stats (solo relevante en sink)                 */
+/* -------------------------------------------------------------------------- */
+#define MAX_PKT_SOURCES 20
+struct pkt_stats {
+  uint8_t  src_id;       /* ID del nodo origen                              */
+  uint16_t seq_max;      /* Mayor seq recibido = total enviados por ese nodo */
+  uint16_t received;     /* Cantidad de paquetes recibidos de ese nodo       */
+};
+static struct pkt_stats pkt_stats_table[MAX_PKT_SOURCES];
+static uint8_t pkt_stats_count = 0;
+
+/* -------------------------------------------------------------------------- */
 /*                         Global Variables                                   */
 /* -------------------------------------------------------------------------- */
-static linkaddr_t best_parent_id;       /* Mejor padre seleccionado          */
-static int16_t    my_path_rssi = -1000; /* Métrica acumulada hacia la raíz   */
+static linkaddr_t best_parent_id;
+static int16_t    my_path_rssi = -1000;
 
-/* Eventos de proceso para los process_post() */
-static process_event_t ev_update_routing; /*    actualizar tabla       */
-static process_event_t ev_route_pkt;      /*    enrutar paquete        */
+static process_event_t ev_update_routing;
+static process_event_t ev_route_pkt;
+
+static clock_time_t trickle_interval;
+
+/* Constantes Trickle (globales para callback y thread) */
+#define TRICKLE_MIN  (CLOCK_SECOND / 8)    /* 125 ms */
+#define TRICKLE_MAX  (CLOCK_SECOND * 4)    /*   4 s  */
+#define KEEPALIVE_TIMEOUT (CLOCK_SECOND * 100) /*  100 s  */
 
 /* -------------------------------------------------------------------------- */
 /*                         Rime Setup                                         */
@@ -47,19 +63,19 @@ static void register_parent(struct broadcast_conn *c, const linkaddr_t *from);
 static void recv_uc(struct unicast_conn *c, const linkaddr_t *from);
 static void sent_uc(struct unicast_conn *c, int status, int num_tx);
 
-static const struct broadcast_callbacks broadcast_call   = {register_parent};
+static const struct broadcast_callbacks broadcast_call    = {register_parent};
 static const struct unicast_callbacks   unicast_callbacks = {recv_uc, sent_uc};
 
 /* -------------------------------------------------------------------------- */
 /*                         Process Declarations                               */
 /* -------------------------------------------------------------------------- */
-PROCESS(broadcast_rssi,            "Beaconing");
-PROCESS(select_prefered_parent,    "RSSI Sum Selection");
-PROCESS(print_parent_list,         "Debug Table");
-PROCESS(send_routing_table,        "Send Routing Table");   /* Timer  */
-PROCESS(update_routing_table,      "Update Routing Table"); /* Post   */
-PROCESS(generate_pkt_dst,          "Generate Pkt Dst");     /* Timer  */
-PROCESS(routing_upstream_downstream,"Routing Up/Down");     /* Post   */
+PROCESS(broadcast_rssi,             "Beaconing");
+PROCESS(select_prefered_parent,     "RSSI Sum Selection");
+PROCESS(print_parent_list,          "Debug Table");
+PROCESS(send_routing_table,         "Send Routing Table");
+PROCESS(update_routing_table,       "Update Routing Table");
+PROCESS(generate_pkt_dst,           "Generate Pkt Dst");
+PROCESS(routing_upstream_downstream,"Routing Up/Down");
 
 AUTOSTART_PROCESSES(
   &broadcast_rssi,
@@ -71,17 +87,48 @@ AUTOSTART_PROCESSES(
   &routing_upstream_downstream
 );
 
+static void
+blink_blue(void)
+{
+  leds_on(LEDS_BLUE);
+  clock_delay(10000);
+  leds_off(LEDS_BLUE);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Callback: keepalive expirado -> resetear trickle al minimo                 */
+/* -------------------------------------------------------------------------- */
+static void
+keepalive_expired(void *ptr)
+{
+  struct preferred_parent *p = (struct preferred_parent *)ptr;
+  printf("KEEPALIVE EXPIRED for %d.%d -> removing from list\n",
+         p->id.u8[0], p->id.u8[1]);
+
+  /* Si la ruta expirada era el padre preferido, invalidar el padre actual*/
+  if(linkaddr_cmp(&best_parent_id, &p->id)) {
+    linkaddr_copy(&best_parent_id, &linkaddr_null);
+    my_path_rssi = -1000;
+    printf("#L %d 0\n", p->id.u8[0]);
+    printf("PARENT LOST: no valid parent now\n");
+  }
+
+  /* Eliminar la entrada de la lista de vecinos/rutas candidatas */
+  list_remove(preferred_parent_list, p);
+  memb_free(&preferred_parent_mem, p);
+
+  /* Resetear Trickle a Ib_min */
+  trickle_interval = TRICKLE_MIN;
+}
 /* ========================================================================== */
-/* CALLBACK: register_parent – Recibe beacon por broadcast                    */
-/*           Actualiza la tabla de vecinos y selecciona el mejor padre.       */
+/* CALLBACK: register_parent                                                  */
 /* ========================================================================== */
 static void
 register_parent(struct broadcast_conn *c, const linkaddr_t *from)
 {
-  int8_t last_rssi = packetbuf_attr(PACKETBUF_ATTR_RSSI);
+  int8_t last_rssi = (int8_t)packetbuf_attr(PACKETBUF_ATTR_RSSI);
   struct beacon *b_recv = (struct beacon *)packetbuf_dataptr();
 
-  /* --- Buscar o crear entrada en la lista de vecinos --- */
   struct preferred_parent *p;
   for(p = list_head(preferred_parent_list); p != NULL; p = list_item_next(p)) {
     if(linkaddr_cmp(&p->id, from)) break;
@@ -96,15 +143,9 @@ register_parent(struct broadcast_conn *c, const linkaddr_t *from)
   p->rssi_p = (int16_t)b_recv->rssi_p + (int16_t)last_rssi;
   p->rssi_a = last_rssi;
 
-  /* Al recibir un beacon, el emisor es un hijo en el árbol n-ario:
-   * agrego "this_node → from" si este nodo es más cercano a la raíz.
-   * (Solo la raíz y nodos con ruta válida registran relaciones padre-hijo.) */
-  if(my_path_rssi > -1000 || linkaddr_node_addr.u8[0] == 1) {
-    Add_child(routing_tree, &tree_n_nodes, MAX_TREE_NODES,
-              linkaddr_node_addr.u8[0], from->u8[0]);
-  }
+  /* Iniciar o reiniciar el ctimer keepalive de 100s para este padre */
+  ctimer_set(&p->keepalive, KEEPALIVE_TIMEOUT, keepalive_expired, p);
 
-  /* --- Selección del mejor padre (solo nodos no-raíz) --- */
   if(linkaddr_node_addr.u8[0] == 1) return;
 
   struct preferred_parent *q, *winner = NULL;
@@ -124,50 +165,104 @@ register_parent(struct broadcast_conn *c, const linkaddr_t *from)
 }
 
 /* ========================================================================== */
-/* CALLBACK: recv_uc – Recibe paquete unicast                                 */
-/*                                                                            */
-/*   si msg_type == U_CONTROL → process_post a update_routing_table           */
-/*   si msg_type == U_DATA    → process_post a routing_up_downstream           */
+/* CALLBACK: recv_uc                                                          */
+/* Primer byte del payload = tipo (U_CONTROL o U_DATA)                        */
 /* ========================================================================== */
 static void
 recv_uc(struct unicast_conn *c, const linkaddr_t *from)
 {
-  uint8_t msg_type = packetbuf_attr(PACKETBUF_ATTR_UNICAST_TYPE);
-  uint8_t len      = packetbuf_datalen();
+  uint16_t len = packetbuf_datalen();
+  if(len == 0) return;
+
+  uint8_t *raw = (uint8_t *)packetbuf_dataptr();
+  uint8_t msg_type = raw[0];
+  uint16_t payload_len = len - 1;
+
+  printf("UC RX from %d.%d len=%u msg_type=%u\n",
+         from->u8[0], from->u8[1], len, msg_type);
 
   if(msg_type == U_CONTROL) {
     /* ---- tabla de enrutamiento recibida ---- */
     char serial_buf[TREE_SERIAL_BUF];
-    if(len >= sizeof(serial_buf)) len = sizeof(serial_buf) - 1;
-    memcpy(serial_buf, packetbuf_dataptr(), len);
-    serial_buf[len] = '\0';
+    if(payload_len >= sizeof(serial_buf)) payload_len = sizeof(serial_buf) - 1;
+    memcpy(serial_buf, raw + 1, payload_len);
+    serial_buf[payload_len] = '\0';
 
     printf("CTRL RECV from %d.%d: %s\n", from->u8[0], from->u8[1], serial_buf);
 
-    /* Copia el string a memoria estática para pasarlo al proceso receptor */
     static char ctrl_payload[TREE_SERIAL_BUF];
-    memcpy(ctrl_payload, serial_buf, len + 1);
+    memcpy(ctrl_payload, serial_buf, payload_len + 1);
 
-    /* Dispara update_routing_table con el string serializado */
     process_post(&update_routing_table, ev_update_routing, ctrl_payload);
 
-  } else {
+  } else if(msg_type == U_DATA) {
     /* ---- paquete de datos a enrutar ---- */
     char msg[32];
-    if(len >= sizeof(msg)) len = sizeof(msg) - 1;
-    memcpy(msg, packetbuf_dataptr(), len);
-    msg[len] = '\0';
+    if(payload_len >= sizeof(msg)) payload_len = sizeof(msg) - 1;
+    memcpy(msg, raw + 1, payload_len);
+    msg[payload_len] = '\0';
 
     printf("DATA RECV from %d.%d: %s\n", from->u8[0], from->u8[1], msg);
+    /* Blink LED when a data message is received */
+    /* This node currently has the message */
+    printf("MESSAGE IS NOW AT NODE %d.%d\n",
+       linkaddr_node_addr.u8[0],
+       linkaddr_node_addr.u8[1]);
+       blink_blue();
 
-    /* Agregar a la lista de paquetes pendientes */
+    /* ------ Actualizar stats de paquetes (solo en sink) ------ */
+    if(linkaddr_node_addr.u8[0] == 1) {
+      /* Formato esperado: DST:<dst>:SEQ:<seq>:<src>:<payload> */
+      uint8_t  pkt_src = 0;
+      uint16_t pkt_seq = 0;
+      const char *sp = msg;
+      /* Saltar DST:<dst>: */
+      if(sp[0]=='D' && sp[1]=='S' && sp[2]=='T' && sp[3]==':') {
+        sp += 4;
+        while(*sp != ':' && *sp != '\0') sp++;
+        if(*sp == ':') sp++;
+      }
+      /* Parsear SEQ:<seq>:<src>: */
+      if(sp[0]=='S' && sp[1]=='E' && sp[2]=='Q' && sp[3]==':') {
+        sp += 4;
+        pkt_seq = (uint16_t)atoi(sp);
+        while(*sp != ':' && *sp != '\0') sp++;
+        if(*sp == ':') sp++;
+        pkt_src = (uint8_t)atoi(sp);
+      }
+      if(pkt_src != 0) {
+        /* Buscar o crear entrada en tabla de stats */
+        /*NOTA: este no sé si funciona bien, probar en simulación*/
+        uint8_t si;
+        struct pkt_stats *ps = NULL;
+        for(si = 0; si < pkt_stats_count; si++) {
+          if(pkt_stats_table[si].src_id == pkt_src) {
+            ps = &pkt_stats_table[si];
+            break;
+          }
+        }
+        if(ps == NULL && pkt_stats_count < MAX_PKT_SOURCES) {
+          ps = &pkt_stats_table[pkt_stats_count++];
+          ps->src_id  = pkt_src;
+          ps->seq_max = 0;
+          ps->received = 0;
+        }
+        if(ps != NULL) {
+          ps->received++;
+          if(pkt_seq > ps->seq_max) {
+            ps->seq_max = pkt_seq;
+          }
+          printf("PKT STATS: src=%u seq=%u received=%u/%u\n",
+                 pkt_src, pkt_seq, ps->received, ps->seq_max);
+        }
+      }
+    }
+
     struct pkt_entry *pe = memb_alloc(&pkt_mem);
     if(pe != NULL) {
-      /* El destino está codificado en el mensaje "DST:<id>:<payload>" */
-      uint8_t dst_id = (uint8_t)from->u8[0]; /* por defecto: reenviar upstream */
+      uint8_t dst_id = (uint8_t)from->u8[0];
       if(msg[0] == 'D' && msg[1] == 'S' && msg[2] == 'T' && msg[3] == ':') {
         dst_id = (uint8_t)atoi(msg + 4);
-        /* Avanzar hasta el segundo ':' para obtener el payload */
         const char *p2 = msg + 4;
         while(*p2 != ':' && *p2 != '\0') p2++;
         if(*p2 == ':') p2++;
@@ -189,28 +284,31 @@ static void
 sent_uc(struct unicast_conn *c, int status, int num_tx)
 {
   const linkaddr_t *dest = packetbuf_addr(PACKETBUF_ADDR_RECEIVER);
-  if(dest) printf("DATA SENT to %d.%d status %d\n",
+  if(dest) printf("SENT to %d.%d status %d\n",
                   dest->u8[0], dest->u8[1], status);
 }
 
 /* ========================================================================== */
-/* THREAD 1: broadcast_rssi – Anuncia la métrica acumulada por broadcast      */
+/* THREAD 1: broadcast_rssi                                                   */
 /* ========================================================================== */
 PROCESS_THREAD(broadcast_rssi, ev, data)
 {
   static struct etimer et;
   static struct beacon b;
+  static clock_time_t wait_time;
+
   PROCESS_EXITHANDLER(broadcast_close(&broadcast);)
   PROCESS_BEGIN();
 
-  /* TX power config omitted: RADIO_PARAM_TXPOWER not available in Contiki classic.
-   * To change TX power on Re-Mote, use cc2538_rf_set_tx_power() from
-   * cpu/cc2538/dev/cc2538-rf.h if needed. */
-
   broadcast_open(&broadcast, 129, &broadcast_call);
 
+  /* Inicializar el intervalo Trickle al minimo */
+  trickle_interval = TRICKLE_MIN;
+
   while(1) {
-    etimer_set(&et, CLOCK_SECOND * 4 + random_rand() % (CLOCK_SECOND * 4));
+    /* Esperar tiempo aleatorio entre [Ib/2, Ib] */
+    wait_time = trickle_interval / 2 + random_rand() % (trickle_interval / 2 + 1);
+    etimer_set(&et, wait_time);
     PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
 
     if(linkaddr_node_addr.u8[0] == 1) {
@@ -223,13 +321,27 @@ PROCESS_THREAD(broadcast_rssi, ev, data)
 
     packetbuf_copyfrom(&b, sizeof(struct beacon));
     broadcast_send(&broadcast);
+
+    printf("TRICKLE: beacon sent | range=[%lu, %lu] ms | Ib=%lu ms | wait=%lu ms\n",
+       (unsigned long)((trickle_interval / 2) * 1000 / CLOCK_SECOND),
+       (unsigned long)(trickle_interval * 1000 / CLOCK_SECOND),
+       (unsigned long)(trickle_interval * 1000 / CLOCK_SECOND),
+       (unsigned long)(wait_time * 1000 / CLOCK_SECOND));
+
+    /* Duplicar el intervalo (x2), sin superar el maximo */
+    if(trickle_interval < TRICKLE_MAX) {
+      trickle_interval *= 2;
+      if(trickle_interval > TRICKLE_MAX) {
+        trickle_interval = TRICKLE_MAX;
+      }
+    }
   }
 
   PROCESS_END();
 }
 
 /* ========================================================================== */
-/* THREAD 2: select_prefered_parent – Inicializa la raíz                      */
+/* THREAD 2: select_prefered_parent                                           */
 /* ========================================================================== */
 PROCESS_THREAD(select_prefered_parent, ev, data)
 {
@@ -240,23 +352,24 @@ PROCESS_THREAD(select_prefered_parent, ev, data)
   memb_init(&pkt_mem);
   list_init(pkt_list);
 
-  /* Asignar eventos de proceso únicos */
   ev_update_routing = process_alloc_event();
   ev_route_pkt      = process_alloc_event();
 
   if(linkaddr_node_addr.u8[0] == 1) {
     my_path_rssi = 0;
-    /* La raíz se inicializa en el árbol */
     routing_tree[0].id           = 1;
     routing_tree[0].num_children = 0;
     tree_n_nodes                 = 1;
   }
 
+  /* Activar powertrace: imprime perfil de energia cada 10 s */
+  powertrace_start(CLOCK_SECOND * 10);
+
   PROCESS_END();
 }
 
 /* ========================================================================== */
-/* THREAD 3: print_parent_list – Tabla de depuración                          */
+/* THREAD 3: print_parent_list                                                */
 /* ========================================================================== */
 PROCESS_THREAD(print_parent_list, ev, data)
 {
@@ -286,45 +399,23 @@ PROCESS_THREAD(print_parent_list, ev, data)
              linkaddr_node_addr.u8[0], linkaddr_node_addr.u8[1]);
     }
     printf("====================================\n\n");
-  }
 
-  PROCESS_END();
-}
-
-/* ========================================================================== */
-/* THREAD 4: send_routing_table                                    */
-/*   - Timer: cada 15 s serializa el árbol n-ario y lo envía por unicast      */
-/*     al padre (y opcionalmente a los hijos conocidos).                      */
-/*   - Usa Serialize() + unicast con PACKETBUF_ATTR_UNICAST_TYPE = U_CONTROL  */
-/* ========================================================================== */
-PROCESS_THREAD(send_routing_table, ev, data)
-{
-  static struct etimer et;
-  PROCESS_EXITHANDLER(unicast_close(&uc);)
-  PROCESS_BEGIN();
-
-  unicast_open(&uc, 146, &unicast_callbacks);
-
-  while(1) {
-    etimer_set(&et, CLOCK_SECOND * 15);
-    PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
-
-    if(tree_n_nodes == 0) continue; /* Árbol vacío, nada que enviar */
-
-    /* Serializar el árbol local */
-    static char serial_buf[TREE_SERIAL_BUF];
-    uint8_t slen = Serialize(routing_tree, tree_n_nodes,
-                             serial_buf, sizeof(serial_buf));
-    if(slen == 0) continue;
-
-    /* Enviar la tabla al padre (upstream) */
-    if(!linkaddr_cmp(&best_parent_id, &linkaddr_null)) {
-      packetbuf_clear();
-      packetbuf_copyfrom(serial_buf, slen + 1);
-      packetbuf_set_attr(PACKETBUF_ATTR_UNICAST_TYPE, U_CONTROL);
-      unicast_send(&uc, &best_parent_id);
-      printf("CTRL SENT to parent %d.%d: %s\n",
-             best_parent_id.u8[0], best_parent_id.u8[1], serial_buf);
+    /* ---------- Tabla de perdida de paquetes (solo sink) ---------- */
+    if(linkaddr_node_addr.u8[0] == 1 && pkt_stats_count > 0) {
+      uint8_t si;
+      printf("\n--- PACKET LOSS TABLE (Sink) ---\n");
+      printf("Source | Received | Sent(seq) | Loss %%\n");
+      for(si = 0; si < pkt_stats_count; si++) {
+        struct pkt_stats *ps = &pkt_stats_table[si];
+        uint16_t lost = ps->seq_max - ps->received;
+        uint16_t loss_pct = 0;
+        if(ps->seq_max > 0) {
+          loss_pct = (uint16_t)((lost * 100) / ps->seq_max);
+        }
+        printf("  %3u  |  %5u   |   %5u   |  %3u%%\n",
+               ps->src_id, ps->received, ps->seq_max, loss_pct);
+      }
+      printf("--------------------------------\n\n");
     }
   }
 
@@ -332,44 +423,81 @@ PROCESS_THREAD(send_routing_table, ev, data)
 }
 
 /* ========================================================================== */
-/* THREAD 5: update_routing_table                                  */
-/*   - Se activa por process_post desde recv_uc cuando llega U_CONTROL.       */
-/*   - Llama a Deserialize() + Add_child() para fusionar la tabla recibida.   */
+/* THREAD 4: send_routing_table                                               */
+/* Formato: [U_CONTROL][serial_buf...]                                        */
+/* ========================================================================== */
+PROCESS_THREAD(send_routing_table, ev, data)
+{
+  static struct etimer et;
+  PROCESS_EXITHANDLER(unicast_close(&uc);)
+  PROCESS_BEGIN();
+  unicast_open(&uc, 146, &unicast_callbacks);
+
+  while(1) {
+    etimer_set(&et, CLOCK_SECOND * 15);
+    PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
+
+    /* Solo enviar si tiene padre */
+    if(linkaddr_cmp(&best_parent_id, &linkaddr_null)) continue;
+
+    /* Serializar el árbol local */
+    static char serial_buf[TREE_SERIAL_BUF];
+    uint8_t slen;
+
+    if(tree_n_nodes == 0) {
+      /* Nodo hoja: notificar al padre que existe */
+      slen = snprintf(serial_buf, sizeof(serial_buf), "%u:;",
+                      linkaddr_node_addr.u8[0]);
+    } else {
+      slen = Serialize(routing_tree, tree_n_nodes,
+                       serial_buf, sizeof(serial_buf));
+    }
+
+    if(slen == 0) continue;
+
+    /* Construir payload: [U_CONTROL][serial_buf] */
+    static char send_buf[TREE_SERIAL_BUF + 1];
+    send_buf[0] = U_CONTROL;
+    memcpy(send_buf + 1, serial_buf, slen + 1);
+
+    packetbuf_clear();
+    packetbuf_copyfrom(send_buf, slen + 2);
+    unicast_send(&uc, &best_parent_id);
+
+    printf("CTRL SENT to parent %d.%d: %s\n",
+           best_parent_id.u8[0], best_parent_id.u8[1], serial_buf);
+  }
+  PROCESS_END();
+}
+
+/* ========================================================================== */
+/* THREAD 5: update_routing_table                                             */
 /* ========================================================================== */
 PROCESS_THREAD(update_routing_table, ev, data)
 {
   PROCESS_BEGIN();
-
   while(1) {
     PROCESS_WAIT_EVENT_UNTIL(ev == ev_update_routing);
-
     const char *serial_str = (const char *)data;
     if(serial_str == NULL) continue;
 
-    /* Reconstruir el árbol recibido en un buffer temporal */
     static struct tree_node recv_tree[MAX_TREE_NODES];
     uint8_t recv_n = Deserialize(serial_str, recv_tree, MAX_TREE_NODES);
-
     printf("ROUTING TABLE RECV: %u nodes\n", recv_n);
 
-    /* Fusionar los nodos recibidos con el árbol local usando Add_child() */
+    if(recv_n == 0) continue;
+
     uint8_t i, j;
+
+    /* Registrar al emisor como hijo directo de este nodo */
+    Add_child(routing_tree, &tree_n_nodes, MAX_TREE_NODES,
+              linkaddr_node_addr.u8[0], recv_tree[0].id);
+
+    /* Fusionar el subárbol recibido */
     for(i = 0; i < recv_n; i++) {
       for(j = 0; j < recv_tree[i].num_children; j++) {
         Add_child(routing_tree, &tree_n_nodes, MAX_TREE_NODES,
                   recv_tree[i].id, recv_tree[i].children[j]);
-      }
-      /* Si el nodo no tiene hijos pero no está en el árbol, agregarlo */
-      if(recv_tree[i].num_children == 0) {
-        uint8_t k, found = 0;
-        for(k = 0; k < tree_n_nodes; k++) {
-          if(routing_tree[k].id == recv_tree[i].id) { found = 1; break; }
-        }
-        if(!found && tree_n_nodes < MAX_TREE_NODES) {
-          routing_tree[tree_n_nodes].id           = recv_tree[i].id;
-          routing_tree[tree_n_nodes].num_children = 0;
-          tree_n_nodes++;
-        }
       }
     }
 
@@ -385,41 +513,38 @@ PROCESS_THREAD(update_routing_table, ev, data)
     }
     printf("\n");
   }
-
   PROCESS_END();
 }
 
 /* ========================================================================== */
-/* THREAD 6: generate_pkt_dst                                      */
-/*   - Timer: genera periódicamente un paquete con destino = DESTINO.         */
-/*   - Solo lo hace el nodo ORIGEN.                                            */
-/*   - Agrega el paquete a pkt_list y dispara routing_upstream_downstream.    */
+/* THREAD 6: generate_pkt_dst                                                 */
 /* ========================================================================== */
 PROCESS_THREAD(generate_pkt_dst, ev, data)
 {
   static struct etimer et;
+  static uint16_t seq_num = 0; /* Sequence number por nodo origen */
   PROCESS_BEGIN();
 
   while(1) {
     etimer_set(&et, CLOCK_SECOND * 20 + random_rand() % (CLOCK_SECOND * 10));
     PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et));
 
-    /* Solo el nodo ORIGEN genera paquetes con destino DESTINO */
     if(linkaddr_node_addr.u8[0] != ORIGEN) continue;
 
-    printf("#A color=orange\n"); /* Identifica el nodo origen en Cooja */
+    seq_num++;
+    printf("#A color=orange\n");
 
     struct pkt_entry *pe = memb_alloc(&pkt_mem);
     if(pe == NULL) continue;
 
     pe->dst = DESTINO;
-    snprintf(pe->msg, sizeof(pe->msg), "Hello from %u to %u",
-             linkaddr_node_addr.u8[0], DESTINO);
+    /* Formato: SEQ:<seq>:<src>:<payload> */
+    snprintf(pe->msg, sizeof(pe->msg), "SEQ:%u:%u:Hi",
+             seq_num, linkaddr_node_addr.u8[0]);
     list_push(pkt_list, pe);
 
-    printf("PKT GEN: dst=%u msg=%s\n", pe->dst, pe->msg);
-
-    /* Disparar el proceso de enrutamiento */
+    printf("PKT GEN: seq=%u dst=%u msg=%s\n", seq_num, pe->dst, pe->msg);
+    blink_blue();
     process_post(&routing_upstream_downstream, ev_route_pkt, NULL);
   }
 
@@ -427,11 +552,8 @@ PROCESS_THREAD(generate_pkt_dst, ev, data)
 }
 
 /* ========================================================================== */
-/* THREAD 7: routing_upstream_downstream                           */
-/*   - Se activa por process_post desde generate_pkt_dst o recv_uc.          */
-/*   - Llama a Search_forwarder() para decidir:                               */
-/*       0   → Upstream: enviar al padre (best_parent_id)                     */
-/*       int → Downstream: enviar al hijo directo con ese ID                  */
+/* THREAD 7: routing_upstream_downstream                                      */
+/* Formato: [U_DATA][DST:<id>:<payload>]                                      */
 /* ========================================================================== */
 PROCESS_THREAD(routing_upstream_downstream, ev, data)
 {
@@ -440,7 +562,6 @@ PROCESS_THREAD(routing_upstream_downstream, ev, data)
   while(1) {
     PROCESS_WAIT_EVENT_UNTIL(ev == ev_route_pkt);
 
-    /* Procesar todos los paquetes en la lista */
     struct pkt_entry *pe;
     while((pe = list_head(pkt_list)) != NULL) {
       list_remove(pkt_list, pe);
@@ -448,14 +569,15 @@ PROCESS_THREAD(routing_upstream_downstream, ev, data)
       uint8_t my_id  = linkaddr_node_addr.u8[0];
       uint8_t dst_id = pe->dst;
 
-      /* Si ya llegamos al destino, entregar localmente */
       if(dst_id == my_id) {
         printf("PKT DELIVERED locally: %s\n", pe->msg);
+        /* Nodo destino: color verde */
+        printf("#A color=blue\n");
+        blink_blue();
         memb_free(&pkt_mem, pe);
         continue;
       }
 
-      /* Llamar a Search_forwarder para decidir la dirección */
       uint8_t forwarder = Search_forwarder(routing_tree, tree_n_nodes,
                                            my_id, dst_id);
 
@@ -463,10 +585,9 @@ PROCESS_THREAD(routing_upstream_downstream, ev, data)
       linkaddr_copy(&next_hop, &linkaddr_null);
 
       if(forwarder == 0) {
-        /* ---------- UPSTREAM ---------- */
         if(!linkaddr_cmp(&best_parent_id, &linkaddr_null)) {
           linkaddr_copy(&next_hop, &best_parent_id);
-          printf("ROUTE UP: %u → parent %u (dst=%u)\n",
+          printf("ROUTE UP: %u -> parent %u (dst=%u)\n",
                  my_id, best_parent_id.u8[0], dst_id);
         } else {
           printf("ROUTE UP: No valid parent for dst=%u, DROP\n", dst_id);
@@ -474,21 +595,28 @@ PROCESS_THREAD(routing_upstream_downstream, ev, data)
           continue;
         }
       } else {
-        /* ---------- DOWNSTREAM ---------- */
         next_hop.u8[0] = forwarder;
         next_hop.u8[1] = 0;
-        printf("ROUTE DOWN: %u → child %u (dst=%u)\n",
+        printf("ROUTE DOWN: %u -> child %u (dst=%u)\n",
                my_id, forwarder, dst_id);
       }
 
-      /* Construir el mensaje con encabezado "DST:<id>:<payload>" */
-      char fwd_msg[40];
-      snprintf(fwd_msg, sizeof(fwd_msg), "DST:%u:%s", dst_id, pe->msg);
+      /* Colorear nodo actual (azul) y dibujar enlace hacia siguiente salto */
+      printf("#A color=blue\n");
+      printf("#L %d 1\n", next_hop.u8[0]);
+      blink_blue();
+      /* Construir payload: [U_DATA][DST:<id>:<msg>] */
+      static char send_buf[42];
+      uint8_t plen = snprintf(send_buf + 1, sizeof(send_buf) - 1,
+                              "DST:%u:%s", dst_id, pe->msg);
+      send_buf[0] = U_DATA;
 
       packetbuf_clear();
-      packetbuf_copyfrom(fwd_msg, strlen(fwd_msg) + 1);
-      packetbuf_set_attr(PACKETBUF_ATTR_UNICAST_TYPE, U_DATA);
+      packetbuf_copyfrom(send_buf, plen + 2);
       unicast_send(&uc, &next_hop);
+
+      /* Borrar enlace después de enviar */
+      printf("#L %d 0\n", next_hop.u8[0]);
 
       memb_free(&pkt_mem, pe);
     }
